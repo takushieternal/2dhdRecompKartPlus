@@ -27,6 +27,9 @@ void opt_defaults(Options* o) {
   o->scale = 3;
   o->turboMask = 0x0100;      // A (items)
   o->turboRate = 4;           // 15 Hz
+  o->netPort = 7845;
+  o->netRollback = true;
+  o->netStats = true;
   opt_defaultBindings(o);
 }
 
@@ -35,7 +38,8 @@ bool opt_load(Options* o, const char* path) {
   if(!f) return false;
   char line[256];
   while(fgets(line, sizeof line, f)) {
-    char key[64]; int v;
+    char key[64]; int v; char str[64];
+    if(sscanf(line, " net_last_join = %47s", str) == 1) { snprintf(o->netLastJoin, sizeof o->netLastJoin, "%s", str); continue; }
     if(sscanf(line, " %63[a-zA-Z0-9_] = %i", key, &v) != 2) continue;
     if(!strcmp(key, "widescreen")) o->widescreen = v;
     else if(!strcmp(key, "hd2d")) o->hd2d = v;
@@ -51,6 +55,10 @@ bool opt_load(Options* o, const char* path) {
     else if(!strcmp(key, "turbo_rate")) o->turboRate = v < 2 ? 2 : v > 8 ? 8 : (v & ~1);
     else if(!strcmp(key, "unlock_everything")) o->unlockAll = v;
     else if(!strcmp(key, "mode_200cc")) o->mode200 = v;
+    else if(!strcmp(key, "net_port")) o->netPort = v < 1024 || v > 65535 ? 7845 : v;
+    else if(!strcmp(key, "net_delay")) o->netDelay = v < 0 ? 0 : v > 8 ? 8 : v;
+    else if(!strcmp(key, "net_rollback")) o->netRollback = v;
+    else if(!strcmp(key, "net_stats")) o->netStats = v;
     else {
       for(int i = 0; i < SB_COUNT; i++) {
         char k[32];
@@ -71,6 +79,8 @@ bool opt_save(const Options* o, const char* path) {
           o->widescreen, o->hd2d, o->hd2dWalls, o->hd2dPost, o->hdMode7, o->recompiled, o->fullscreen, o->scale);
   fprintf(f, "auto_gas = %d\nturbo = %d\nturbo_buttons = 0x%03x\nturbo_rate = %d\nunlock_everything = %d\nmode_200cc = %d\n",
           o->autoGas, o->turbo, o->turboMask, o->turboRate, o->unlockAll, o->mode200);
+  fprintf(f, "net_port = %d\nnet_delay = %d\nnet_rollback = %d\nnet_stats = %d\n", o->netPort, o->netDelay, o->netRollback, o->netStats);
+  if(o->netLastJoin[0]) fprintf(f, "net_last_join = %s\n", o->netLastJoin);
   fprintf(f, "# key_*: SDL scancodes, pad_*: SDL game controller buttons (100/101 = left/right trigger, -1 = none)\n");
   for(int i = 0; i < SB_COUNT; i++) fprintf(f, "key_%s = %d\n", btnKey[i], o->keyBind[i]);
   for(int i = 0; i < SB_COUNT; i++) fprintf(f, "pad_%s = %d\n", btnKey[i], o->padBind[i]);
@@ -99,19 +109,25 @@ uint16_t opt_transformPad(const Options* o, PadState* st, uint16_t raw, bool rac
 // ------------------------------------------------------------------ menu model
 enum {
   // main page
-  IT_VIDEO, IT_GAME, IT_CONTROLS, IT_PHOTO, IT_RESUME, IT_QUIT,
+  IT_VIDEO, IT_GAME, IT_CONTROLS, IT_ONLINE, IT_PHOTO, IT_RESUME, IT_QUIT,
   // video
   IT_WIDE, IT_HD2D, IT_WALLS, IT_POST, IT_HDM7, IT_ENGINE, IT_FULL, IT_SCALE, IT_BACKV,
   // gameplay
   IT_AUTOGAS, IT_TURBO, IT_TURBOBTN, IT_TURBORATE, IT_UNLOCK, IT_200, IT_BACKG,
   // controls
   IT_BIND0, IT_BINDLAST = IT_BIND0 + SB_COUNT - 1, IT_RESETBIND, IT_BACKC,
+  // online
+  IT_NHOST, IT_NJOIN, IT_NROLL, IT_NDELAY, IT_NPORT, IT_NSTATS, IT_NDISC, IT_BACKO,
+  // host
+  IT_HCOPY, IT_HPUNCH, IT_HCANCEL,
+  // join
+  IT_JCODE, IT_JCONNECT, IT_JLAN0, IT_JLAN3 = IT_JLAN0 + 3, IT_JSEARCH, IT_JCOPY, IT_JCANCEL,
   IT_COUNT
 };
-enum { PG_MAIN, PG_VIDEO, PG_GAME, PG_CONTROLS, PG_COUNT };
-static const int pageFirst[PG_COUNT] = {IT_VIDEO, IT_WIDE, IT_AUTOGAS, IT_BIND0};
-static const int pageLast[PG_COUNT] = {IT_QUIT, IT_BACKV, IT_BACKG, IT_BACKC};
-static const char* const pageTitle[PG_COUNT] = {"ENHANCEMENTS", "VIDEO", "GAMEPLAY", "CONTROLS"};
+enum { PG_MAIN, PG_VIDEO, PG_GAME, PG_CONTROLS, PG_ONLINE, PG_HOST, PG_JOIN, PG_COUNT };
+static const int pageFirst[PG_COUNT] = {IT_VIDEO, IT_WIDE, IT_AUTOGAS, IT_BIND0, IT_NHOST, IT_HCOPY, IT_JCODE};
+static const int pageLast[PG_COUNT] = {IT_QUIT, IT_BACKV, IT_BACKG, IT_BACKC, IT_BACKO, IT_HCANCEL, IT_JCANCEL};
+static const char* const pageTitle[PG_COUNT] = {"ENHANCEMENTS", "VIDEO", "GAMEPLAY", "CONTROLS", "ONLINE", "HOST A GAME", "JOIN A GAME"};
 
 struct Menu {
   bool open;
@@ -121,6 +137,8 @@ struct Menu {
   int repeat;           // auto-repeat counter for held Up/Down
   int capture;          // SNES button being rebound, or -1
   int captureFrames;
+  int edit;             // text field being edited: 0 none, 1 join code, 2 player 2's code (host)
+  int oskX, oskY;       // on-screen keyboard cursor
 };
 
 Menu* menu_create(void) { Menu* m = calloc(1, sizeof(Menu)); m->capture = -1; return m; }
@@ -130,7 +148,7 @@ void menu_open(Menu* m) {
   m->open = true; m->page = PG_MAIN; m->sel = IT_VIDEO; m->prev = 0xffff; m->repeat = 0; m->capture = -1;   // prev: ignore the opening press
   for(int p = 0; p < PG_COUNT; p++) m->ret[p] = pageFirst[p];
 }
-void menu_close(Menu* m) { m->open = false; m->capture = -1; }
+void menu_close(Menu* m) { m->open = false; m->capture = -1; m->edit = 0; }
 bool menu_capturing(const Menu* m) { return m->open && m->capture >= 0; }
 void menu_captureCancel(Menu* m) { m->capture = -1; m->prev = 0xffff; }
 
@@ -150,7 +168,19 @@ void menu_capturePad(Menu* m, Options* o, int btn) {
 }
 
 static bool itemEnabled(int it, const Options* o, const MenuCaps* c) {
+  const NetUi* u = c->net;
+  int nm = u ? u->mode : NETUI_OFF;
   switch(it) {
+    case IT_ONLINE: return u != NULL;
+    case IT_NHOST: return nm != NETUI_RUNNING && nm != NETUI_JOINING;
+    case IT_NJOIN: return nm != NETUI_RUNNING && nm != NETUI_HOSTING;
+    case IT_NROLL: case IT_NDELAY: case IT_NPORT: return nm == NETUI_OFF;
+    case IT_NDISC: return nm == NETUI_RUNNING;
+    case IT_HCOPY: return u && u->code[0];
+    case IT_HPUNCH: return nm == NETUI_HOSTING;
+    case IT_JCONNECT: return u && u->joinText[0] && nm != NETUI_RUNNING;
+    case IT_JCOPY: return u && u->code[0];
+    case IT_JLAN0: case IT_JLAN0 + 1: case IT_JLAN0 + 2: case IT_JLAN3: return u && it - IT_JLAN0 < u->nlan && nm != NETUI_RUNNING;
     case IT_PHOTO: return c->glAvailable && o->hd2d && c->photoReady && !c->netplay;
     case IT_HD2D: return c->glAvailable;
     case IT_WALLS: case IT_POST: return c->glAvailable && o->hd2d;
@@ -178,6 +208,74 @@ static const char* const turboPresetNames[] = {"A", "B", "A+B", "Y", "X", "A+B+X
 #define B_A 0x0100
 #define B_X 0x0200
 
+// ---- text fields + on-screen keyboard
+#define OSK_COLS 8
+static char oskChar(int x, int y) {        // rows 0-3: 32 base32 characters, 8 per row
+  static const char B32[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  return B32[y * OSK_COLS + x];
+}
+static const char* const oskLast[] = {".", ":", "-", "DEL", "PASTE", "OK"};
+#define OSK_LAST 6
+static char* editField(Menu* m, NetUi* u) {
+  if(!u) return NULL;
+  return m->edit == 1 ? u->joinText : m->edit == 2 ? u->punchText : NULL;
+}
+bool menu_editing(const Menu* m) { return m->open && m->edit != 0; }
+void menu_editText(Menu* m, NetUi* u, const char* t) {
+  char* f = editField(m, u);
+  if(!f) return;
+  int cap = 47, l = (int)strlen(f);
+  for(; *t && l < cap; t++) {
+    char ch = *t;
+    if(ch >= 'a' && ch <= 'z') ch -= 32;
+    if((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || ch == '.' || ch == ':' || ch == '-') { f[l++] = ch; f[l] = 0; }
+  }
+}
+static int finishEdit(Menu* m) {
+  int which = m->edit;
+  m->edit = 0; m->prev = 0xffff;
+  return which == 1 ? MENU_NET_JOIN : which == 2 ? MENU_NET_PUNCH : MENU_NONE;
+}
+int menu_editKey(Menu* m, NetUi* u, int key) {
+  char* f = editField(m, u);
+  if(!f) return MENU_NONE;
+  if(key == EDIT_BACKSPACE) { int l = (int)strlen(f); if(l) f[l - 1] = 0; return MENU_NONE; }
+  if(key == EDIT_CANCEL) { m->edit = 0; m->prev = 0xffff; return MENU_NONE; }
+  if(key == EDIT_ENTER) return f[0] ? finishEdit(m) : (m->edit = 0, MENU_NONE);
+  return MENU_NONE;
+}
+static int oskUpdate(Menu* m, uint16_t pressed, NetUi* u) {
+  int rowLen = m->oskY < 4 ? OSK_COLS : OSK_LAST;
+  if(pressed & B_LEFT) m->oskX = (m->oskX + rowLen - 1) % rowLen;
+  if(pressed & B_RIGHT) m->oskX = (m->oskX + 1) % rowLen;
+  if(pressed & B_UP) m->oskY = (m->oskY + 4) % 5;
+  if(pressed & B_DOWN) m->oskY = (m->oskY + 1) % 5;
+  rowLen = m->oskY < 4 ? OSK_COLS : OSK_LAST;
+  if(m->oskX >= rowLen) m->oskX = rowLen - 1;
+  if(pressed & (B_B | B_Y)) return menu_editKey(m, u, EDIT_BACKSPACE);
+  if(pressed & B_X) return menu_editKey(m, u, EDIT_CANCEL);
+  if(pressed & B_START) return menu_editKey(m, u, EDIT_ENTER);
+  if(pressed & B_A) {
+    if(m->oskY < 4) { char t[2] = {oskChar(m->oskX, m->oskY), 0}; menu_editText(m, u, t); return MENU_NONE; }
+    switch(m->oskX) {
+      case 0: menu_editText(m, u, "."); break;
+      case 1: menu_editText(m, u, ":"); break;
+      case 2: menu_editText(m, u, "-"); break;
+      case 3: return menu_editKey(m, u, EDIT_BACKSPACE);
+      case 4: return MENU_NET_PASTE;
+      case 5: return menu_editKey(m, u, EDIT_ENTER);
+    }
+  }
+  return MENU_NONE;
+}
+static void startEdit(Menu* m, int which) { m->edit = which; m->oskX = 0; m->oskY = 0; }
+
+void menu_showOnline(Menu* m, int page) {
+  if(!m->open) menu_open(m);
+  m->page = page == 1 ? PG_HOST : page == 2 ? PG_JOIN : PG_ONLINE;
+  m->sel = pageFirst[m->page];
+}
+
 static void gotoPage(Menu* m, int page) {
   m->ret[m->page] = m->sel;
   m->page = page;
@@ -193,13 +291,14 @@ int menu_update(Menu* m, uint16_t pad, Options* o, const MenuCaps* c) {
   }
   uint16_t pressed = pad & ~m->prev;
   m->prev = pad;
+  if(m->edit) return oskUpdate(m, pressed, c->net);
   // held up/down repeat after ~1/3 s
   if(pad & (B_UP | B_DOWN)) { if(++m->repeat > 20 && (m->repeat % 6) == 0) pressed |= pad & (B_UP | B_DOWN); }
   else m->repeat = 0;
   if(pressed & (B_START | B_SELECT)) { menu_close(m); return MENU_CLOSED; }
   if(pressed & B_X) {                         // X: back one page (closes from the main page)
     if(m->page == PG_MAIN) { menu_close(m); return MENU_CLOSED; }
-    gotoPage(m, PG_MAIN);
+    gotoPage(m, m->page == PG_HOST || m->page == PG_JOIN ? PG_ONLINE : PG_MAIN);
     return MENU_NONE;
   }
   int first = pageFirst[m->page], n = pageLast[m->page] - first + 1;
@@ -220,10 +319,45 @@ int menu_update(Menu* m, uint16_t pad, Options* o, const MenuCaps* c) {
     case IT_VIDEO: if(confirm) gotoPage(m, PG_VIDEO); return MENU_NONE;
     case IT_GAME: if(confirm) gotoPage(m, PG_GAME); return MENU_NONE;
     case IT_CONTROLS: if(confirm) gotoPage(m, PG_CONTROLS); return MENU_NONE;
+    case IT_ONLINE: if(confirm) gotoPage(m, PG_ONLINE); return MENU_NONE;
+    case IT_NHOST:
+      if(!confirm) return MENU_NONE;
+      gotoPage(m, PG_HOST);
+      return c->net->mode == NETUI_HOSTING ? MENU_NONE : MENU_NET_HOST;
+    case IT_NJOIN:
+      if(!confirm) return MENU_NONE;
+      gotoPage(m, PG_JOIN);
+      if(!c->net->joinText[0] && o->netLastJoin[0]) snprintf(c->net->joinText, sizeof c->net->joinText, "%s", o->netLastJoin);
+      return MENU_NET_JOINPAGE;
+    case IT_NDISC: return confirm ? MENU_NET_DISCONNECT : MENU_NONE;
+    case IT_BACKO: if(confirm) gotoPage(m, PG_MAIN); return MENU_NONE;
+    case IT_HCOPY: case IT_JCOPY: return confirm ? MENU_NET_COPY : MENU_NONE;
+    case IT_HPUNCH: if(confirm) startEdit(m, 2); return MENU_NONE;
+    case IT_JCODE: if(confirm) startEdit(m, 1); return MENU_NONE;
+    case IT_JCONNECT: return confirm ? MENU_NET_JOIN : MENU_NONE;
+    case IT_JSEARCH: return confirm ? MENU_NET_LANSEARCH : MENU_NONE;
+    case IT_HCANCEL: case IT_JCANCEL:
+      if(!confirm) return MENU_NONE;
+      gotoPage(m, PG_ONLINE);
+      return c->net->mode == NETUI_RUNNING ? MENU_NONE : MENU_NET_CANCEL;
+    case IT_NROLL: o->netRollback = !o->netRollback; break;
+    case IT_NSTATS: o->netStats = !o->netStats; break;
+    case IT_NDELAY:
+      if(pressed & B_LEFT) o->netDelay = o->netDelay <= 0 ? 8 : o->netDelay - 1;
+      else o->netDelay = o->netDelay >= 8 ? 0 : o->netDelay + 1;
+      break;
+    case IT_NPORT:
+      if(pressed & B_LEFT) o->netPort = o->netPort <= 1024 ? 65535 : o->netPort - 1;
+      else o->netPort = o->netPort >= 65535 ? 1024 : o->netPort + 1;
+      break;
     case IT_PHOTO: if(confirm) { menu_close(m); return MENU_PHOTO; } return MENU_NONE;
     case IT_RESUME: if(confirm) { menu_close(m); return MENU_CLOSED; } return MENU_NONE;
     case IT_QUIT: if(confirm) return MENU_QUIT; return MENU_NONE;
     case IT_BACKV: case IT_BACKG: case IT_BACKC: if(confirm) gotoPage(m, PG_MAIN); return MENU_NONE;
+    case IT_JLAN0: case IT_JLAN0 + 1: case IT_JLAN0 + 2: case IT_JLAN3:
+      if(!confirm) return MENU_NONE;
+      c->net->lanSel = it - IT_JLAN0;
+      return MENU_NET_JOINLAN;
     case IT_WIDE: o->widescreen = !o->widescreen; if(!o->widescreen) o->hd2d = false; break;
     case IT_HD2D: o->hd2d = !o->hd2d; if(o->hd2d) o->widescreen = true; break;
     case IT_WALLS: o->hd2dWalls = !o->hd2dWalls; break;
@@ -304,7 +438,30 @@ void menu_draw(const Menu* m, const Options* o, const MenuCaps* c, uint32_t* p) 
   textCenter(p, py + 6, pageTitle[m->page], GOLD);
   int first = pageFirst[m->page], last = pageLast[m->page];
   bool ctl = m->page == PG_CONTROLS;
-  int y0 = py + 24, step = m->page == PG_MAIN ? 18 : ctl ? 11 : 15;
+  const NetUi* u = c->net;
+  int y0 = py + 24, step = m->page == PG_MAIN ? 17 : ctl ? 11 : m->page >= PG_ONLINE ? 13 : 15;
+  if(m->page == PG_HOST && u) {           // room code block
+    text(p, px + 12, y0, "YOUR ROOM CODE (SEND IT TO PLAYER 2):", RGBA(150, 160, 190, 255), true);
+    const char* code = u->code[0] ? u->code : "...";
+    int cw = (int)strlen(code) * 12;
+    for(int k = 0; code[k]; k++) {          // double-size code
+      char ch[2] = {code[k], 0};
+      uint32_t tmp[MENU_W * 9];
+      (void)tmp;
+      unsigned cc = (unsigned char)ch[0]; if(cc < 32 || cc > 127) cc = '?';
+      const uint8_t* g = font5x7[cc - 32];
+      int x0 = (MENU_W - cw) / 2 + k * 12;
+      for(int r = 0; r < 7; r++) for(int b = 0; b < 5; b++) if(g[r] & (0x10 >> b)) {
+        fill(p, x0 + b * 2 + 1, y0 + 12 + r * 2 + 1, 2, 2, RGBA(0, 0, 0, 255));
+        fill(p, x0 + b * 2, y0 + 12 + r * 2, 2, 2, GOLD);
+      }
+    }
+    textCenter(p, y0 + 30, u->codeNote, RGBA(150, 160, 190, 255));
+    char l[64]; snprintf(l, sizeof l, "SAME NETWORK: %s", u->lan);
+    textCenter(p, y0 + 41, l, RGBA(150, 160, 190, 255));
+    y0 += 56;
+  }
+  if(m->page == PG_ONLINE && u && u->mode == NETUI_RUNNING) y0 += 0;
   if(ctl) {
     text(p, px + 16, y0, "BUTTON", RGBA(150, 160, 190, 255), true);
     text(p, px + 76, y0, "KEYBOARD", RGBA(150, 160, 190, 255), true);
@@ -319,10 +476,17 @@ void menu_draw(const Menu* m, const Options* o, const MenuCaps* c, uint32_t* p) 
     [IT_AUTOGAS] = "AUTO-GAS", [IT_TURBO] = "TURBO", [IT_TURBOBTN] = "  TURBO BUTTONS", [IT_TURBORATE] = "  TURBO SPEED",
     [IT_UNLOCK] = "UNLOCK EVERYTHING", [IT_200] = "200CC (REPLACES 150CC)", [IT_BACKG] = "BACK",
     [IT_RESETBIND] = "RESET TO DEFAULTS", [IT_BACKC] = "BACK",
+    [IT_ONLINE] = "ONLINE",
+    [IT_NHOST] = "HOST A GAME", [IT_NJOIN] = "JOIN A GAME", [IT_NROLL] = "ROLLBACK", [IT_NDELAY] = "INPUT DELAY",
+    [IT_NPORT] = "HOST PORT (UDP)", [IT_NSTATS] = "SHOW PING", [IT_NDISC] = "DISCONNECT", [IT_BACKO] = "BACK",
+    [IT_HCOPY] = "COPY ROOM CODE", [IT_HPUNCH] = "PLAYER 2'S CODE", [IT_HCANCEL] = "STOP HOSTING",
+    [IT_JCODE] = "ROOM CODE", [IT_JCONNECT] = "CONNECT", [IT_JSEARCH] = "SEARCH THIS NETWORK AGAIN",
+    [IT_JCOPY] = "COPY MY CODE", [IT_JCANCEL] = "BACK",
   };
   for(int it = first; it <= last; it++) {
     int i = it - first;
-    bool gap = (m->page == PG_MAIN && it >= IT_RESUME) || (it == IT_BACKV || it == IT_BACKG) || (it >= IT_RESETBIND);
+    bool gap = (m->page == PG_MAIN && it >= IT_RESUME) || (it == IT_BACKV || it == IT_BACKG) || (it >= IT_RESETBIND && it <= IT_BACKC) ||
+               it == IT_BACKO || it == IT_NDISC || it == IT_HCANCEL || it == IT_JCANCEL || it == IT_JCOPY || (it >= IT_JLAN0 && it <= IT_JSEARCH);
     int y = y0 + i * step + (gap ? (ctl ? 3 : 6) : 0);
     bool en = itemEnabled(it, o, c);
     bool sel = it == m->sel;
@@ -339,11 +503,37 @@ void menu_draw(const Menu* m, const Options* o, const MenuCaps* c, uint32_t* p) 
       text(p, px + 166, y, opt_padName(o->padBind[b]), RGBA(120, 200, 255, 255), true);
       continue;
     }
+    if(it >= IT_JLAN0 && it <= IT_JLAN3) {
+      int k = it - IT_JLAN0;
+      if(u && k < u->nlan) text(p, px + 16, y, u->lanNames[k], col, true);
+      else if(k == 0) text(p, px + 16, y, "(NO GAMES ON THIS NETWORK)", RGBA(110, 110, 120, 255), true);
+      continue;
+    }
+    if((it == IT_JCODE || it == IT_HPUNCH) && u) {
+      const char* f = it == IT_JCODE ? u->joinText : u->punchText;
+      bool ed = (it == IT_JCODE && m->edit == 1) || (it == IT_HPUNCH && m->edit == 2);
+      text(p, px + 16, y, names[it], col, true);
+      int fx = px + 16 + ((int)strlen(names[it]) + 1) * 6, fw = px + pw - 8 - fx;
+      fill(p, fx - 2, y - 2, fw + 2, 11, ed ? RGBA(30, 40, 90, 255) : RGBA(20, 24, 50, 255));
+      int maxc = fw / 6 - 1, l = (int)strlen(f);
+      const char* shown = l > maxc ? f + (l - maxc) : f;
+      int ex = text(p, fx, y, shown[0] || ed ? shown : (it == IT_JCODE ? "A: TYPE IT" : "OPTIONAL"), shown[0] ? GOLD : RGBA(110, 110, 120, 255), true);
+      if(ed) fill(p, ex, y + 7, 5, 1, GOLD);
+      continue;
+    }
     text(p, px + 16, y, names[it] ? names[it] : "?", col, true);
     const char* val = NULL; bool on = false; char buf[24];
     bool netLocked = c->netplay && (it == IT_UNLOCK || it == IT_200);
     switch(it) {
       case IT_VIDEO: case IT_GAME: case IT_CONTROLS: val = ">"; on = true; break;
+      case IT_ONLINE: on = true; val = !u ? ">" : u->mode == NETUI_RUNNING ? "CONNECTED" : u->mode == NETUI_HOSTING ? "HOSTING" : u->mode == NETUI_JOINING ? "JOINING" : ">"; break;
+      case IT_NHOST: on = true; val = u && u->mode == NETUI_HOSTING ? "WAITING >" : ">"; break;
+      case IT_NJOIN: on = true; val = u && u->mode == NETUI_JOINING ? "CONNECTING >" : ">"; break;
+      case IT_NROLL: on = o->netRollback; val = onOff(on); break;
+      case IT_NDELAY: on = true; if(o->netDelay) snprintf(buf, sizeof buf, "< %d FRAME%s >", o->netDelay, o->netDelay > 1 ? "S" : ""); else snprintf(buf, sizeof buf, "< AUTO >"); val = buf; break;
+      case IT_NPORT: on = true; snprintf(buf, sizeof buf, "< %d >", o->netPort); val = buf; break;
+      case IT_NSTATS: on = o->netStats; val = onOff(on); break;
+      case IT_JCOPY: on = true; val = u && u->code[0] ? u->code : "..."; break;
       case IT_PHOTO: on = en; val = !c->glAvailable || !o->hd2d ? "HD-2D ONLY" : c->netplay ? "OFFLINE ONLY" : !c->photoReady ? "IN A RACE" : ">"; break;
       case IT_WIDE: on = o->widescreen; val = onOff(on); break;
       case IT_HD2D: on = o->hd2d; val = !c->glAvailable ? "N/A" : onOff(on); break;
@@ -375,11 +565,42 @@ void menu_draw(const Menu* m, const Options* o, const MenuCaps* c, uint32_t* p) 
       textRight(p, px + pw - 8, y, val, vc);
     }
   }
+  // online status line
+  if(u && m->page >= PG_ONLINE) {
+    char st[64];
+    if(m->page == PG_ONLINE && u->mode == NETUI_RUNNING)
+      snprintf(st, sizeof st, "%s  PING %dMS  DELAY %d%s", u->isHost ? "HOST" : "PLAYER 2", u->ping, u->delay, u->rollback ? "  ROLLBACK" : "");
+    else snprintf(st, sizeof st, "%s", u->status);
+    if(m->page == PG_JOIN && u->code[0] && !st[0]) snprintf(st, sizeof st, "%s", u->codeNote);
+    textCenter(p, py + ph - 24, st, u->mode == NETUI_RUNNING ? RGBA(120, 240, 120, 255) : RGBA(255, 230, 120, 255));
+  }
+  // on-screen keyboard
+  if(m->edit) {
+    int kx = px + 8, ky = py + ph - 86, kw = pw - 16;
+    fill(p, kx, ky, kw, 76, RGBA(8, 10, 28, 245));
+    fill(p, kx, ky, kw, 1, GOLD);
+    for(int r = 0; r < 4; r++) for(int k = 0; k < OSK_COLS; k++) {
+      int cx = kx + 8 + k * 26, cy = ky + 5 + r * 13;
+      bool on = m->oskY == r && m->oskX == k;
+      if(on) fill(p, cx - 3, cy - 2, 13, 11, RGBA(60, 80, 160, 255));
+      char t[2] = {oskChar(k, r), 0};
+      text(p, cx, cy, t, on ? RGBA(255, 255, 255, 255) : RGBA(200, 210, 230, 255), true);
+    }
+    static const int lastX[OSK_LAST] = {0, 22, 44, 72, 110, 158};
+    for(int k = 0; k < OSK_LAST; k++) {
+      int cx = kx + 10 + lastX[k], cy = ky + 5 + 4 * 13;
+      bool on = m->oskY == 4 && m->oskX == k;
+      if(on) fill(p, cx - 3, cy - 2, (int)strlen(oskLast[k]) * 6 + 6, 11, RGBA(60, 80, 160, 255));
+      text(p, cx, cy, oskLast[k], on ? RGBA(255, 255, 255, 255) : GOLD, true);
+    }
+  }
   const char* help;
-  if(m->capture >= 0) help = "ESC: CANCEL";
+  if(m->edit) help = "A TYPE  B DELETE  START OK  X CLOSE";
+  else if(m->capture >= 0) help = "ESC: CANCEL";
   else if(ctl) help = "A: REBIND   X: BACK   START: CLOSE";
   else if(m->page == PG_GAME && c->netplay) help = "NETPLAY: RULES ARE SET BY THE HOST";
   else if(m->page == PG_GAME && !c->unlocked200 && m->sel == IT_200) help = "WIN 150CC SPECIAL CUP GOLD FOR 200CC";
+  else if(m->page == PG_HOST || m->page == PG_JOIN) help = "A: SELECT   X: BACK   START: CLOSE";
   else if(m->page != PG_MAIN) help = "A: CHANGE   X: BACK   START: CLOSE";
   else help = c->netplay ? "NETPLAY: GAME KEEPS RUNNING" : "A: SELECT   START: CLOSE";
   textCenter(p, py + ph - 12, help, RGBA(170, 180, 210, 255));
@@ -406,5 +627,20 @@ void menu_drawPhotoHint(uint32_t* p, const char* msg, bool showHelp) {
     int w = (int)strlen(msg) * 6 + 8;
     fill(p, (MENU_W - w) / 2, 16, w, 11, RGBA(12, 16, 40, 200));
     textCenter(p, 18, msg, RGBA(120, 240, 120, 255));
+  }
+}
+
+void menu_drawStatus(uint32_t* p, const char* hud, const char* toast) {
+  memset(p, 0, MENU_W * MENU_H * 4);
+  if(hud && hud[0]) {
+    int w = (int)strlen(hud) * 6 + 4;
+    fill(p, 0, 0, w, 10, RGBA(12, 16, 40, 140));
+    text(p, 2, 1, hud, RGBA(200, 230, 200, 255), true);
+  }
+  if(toast && toast[0]) {
+    int w = (int)strlen(toast) * 6 + 10;
+    fill(p, (MENU_W - w) / 2, 100, w, 14, RGBA(12, 16, 40, 220));
+    fill(p, (MENU_W - w) / 2, 100, w, 1, GOLD);
+    textCenter(p, 104, toast, RGBA(255, 230, 120, 255));
   }
 }

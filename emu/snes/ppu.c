@@ -273,7 +273,8 @@ void ppu_runLine(Ppu* ppu, int line) {
   // called for lines 1-224/239
   // evaluate sprites
   memset(ppu->objPixelBuffer, 0, sizeof(ppu->objPixelBuffer));
-  if(!ppu->forcedBlank) ppu_evaluateSprites(ppu, line - 1);
+  if(!ppu->forcedBlank) ppu_evaluateSprites(ppu, line - 1);   // also sets the range/time-over flags: always
+  if(ppu->headless) return;          // rollback resimulation: no pixels (nothing below changes emulated state)
   // actual line
   if(ppu->mode == 7) ppu_calculateMode7Starts(ppu, line);
   if(line < 240) {

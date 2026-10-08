@@ -138,6 +138,7 @@ struct Ppu {
   uint8_t pixelBuffer2[512 * 4 * 239 * 2];     // lower half-line of HD rows
   bool rowHd[239 * 2];
   // Widescreen (render-only): PPU_WS_EXT extra pixels on each side
+  bool headless;          // skip pixel output (rollback resimulation); not part of the savestate
   bool widescreen;
   uint8_t objPixW[256 + 2 * PPU_WS_EXT], objPrioW[256 + 2 * PPU_WS_EXT];
   bool wsFrameHasM7, wsPrevFrameHasM7;

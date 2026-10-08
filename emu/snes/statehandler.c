@@ -20,8 +20,8 @@ StateHandler* sh_init(bool saving, const uint8_t* data, int size) {
     memcpy(sh->data, data, size);
     sh->allocSize = size;
   } else {
-    sh->data = malloc(1024);
-    sh->allocSize = 1024;
+    sh->data = malloc(512 * 1024);
+    sh->allocSize = 512 * 1024;
   }
   return sh;
 }
@@ -227,25 +227,37 @@ void sh_handleDoubles(StateHandler* sh, ...) {
   va_end(args);
 }
 
+static void sh_reserve(StateHandler* sh, int n) {
+  while(sh->offset + n > sh->allocSize) {
+    sh->data = realloc(sh->data, sh->allocSize * 2);
+    sh->allocSize *= 2;
+  }
+}
+
 void sh_handleByteArray(StateHandler* sh, uint8_t* data, int size) {
-  for(int i = 0; i < size; i++) {
-    if(sh->saving) {
-      sh_writeByte(sh, data[i]);
-    } else {
-      data[i] = sh_readByte(sh);
-    }
+  if(sh->saving) {
+    sh_reserve(sh, size);
+    memcpy(sh->data + sh->offset, data, size);
+    sh->offset += size;
+  } else {
+    int n = sh->offset + size <= sh->allocSize ? size : (sh->allocSize > sh->offset ? sh->allocSize - sh->offset : 0);
+    memcpy(data, sh->data + sh->offset, n);
+    if(n < size) memset(data + n, 0, size - n);
+    sh->offset += size;
   }
 }
 
 void sh_handleWordArray(StateHandler* sh, uint16_t* data, int size) {
+  // stored little-endian, low byte first
+  if(sh->saving) sh_reserve(sh, size * 2);
   for(int i = 0; i < size; i++) {
     if(sh->saving) {
-      sh_writeByte(sh, data[i] & 0xff);
-      sh_writeByte(sh, (data[i] >> 8) & 0xff);
-    } else {
-      data[i] = sh_readByte(sh);
-      data[i] |= sh_readByte(sh) << 8;
-    }
+      sh->data[sh->offset++] = data[i] & 0xff;
+      sh->data[sh->offset++] = data[i] >> 8;
+    } else if(sh->offset + 2 <= sh->allocSize) {
+      data[i] = sh->data[sh->offset] | sh->data[sh->offset + 1] << 8;
+      sh->offset += 2;
+    } else { data[i] = 0; sh->offset += 2; }
   }
 }
 

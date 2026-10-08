@@ -128,13 +128,47 @@ void snes_runFrame(Snes* snes) {
   snes_catchupApu(snes); // catch up the apu after running
 }
 
+// How many 2-cycle steps from here can't trigger anything (see snes_runCycle): no h/v position
+// event, no line end, no IRQ condition change. 0 = run the next step the normal way.
+static int snes_plainSteps(Snes* snes) {
+  if(snes->palTiming) return 0;
+  int h = snes->hPos;
+  if(h == 0 || h == 16 || h == 512 || h == 1104) return 0;
+  int end = (snes->vPos == 240 && !snes->ppu->evenFrame && !snes->ppu->frameInterlace) ? 1360 : 1364;
+  int ev = end;
+  if(h < 16) ev = 16;
+  else if(h < 512) ev = 512;
+  else if(h < 1104) ev = 1104;
+  int k = ev == end ? (end - h) / 2 - 1 : (ev - h) / 2;
+  if(snes->hIrqEnabled) {
+    int H = snes->hTimer * 4;
+    if(H == h) return 0;
+    if(H > h && H < h + 2 * k) k = (H - h) / 2;
+  }
+  bool cond = (snes->vIrqEnabled || snes->hIrqEnabled) && (snes->vPos == snes->vTimer || !snes->vIrqEnabled) &&
+              (h == snes->hTimer * 4 || !snes->hIrqEnabled);
+  if(cond != snes->irqCondition) return 0;
+  return k;
+}
+
 void snes_runCycles(Snes* snes, int cycles) {
   if(snes->hPos + cycles >= 536 && snes->hPos < 536) {
     // if we go past 536, add 40 cycles for dram refersh
     cycles += 40;
   }
-  for(int i = 0; i < cycles; i += 2) {
-    snes_runCycle(snes);
+  // Same result as calling snes_runCycle once per 2 master cycles, but runs of cycles where
+  // nothing can happen (no h/v event, no IRQ edge) are done in one go (rollback needs the speed).
+  int n = (cycles + 1) / 2;
+  while(n > 0) {
+    int k = snes_plainSteps(snes);
+    if(k <= 0) { snes_runCycle(snes); n--; continue; }
+    if(k > n) k = n;
+    double rate = apuCyclesPerMaster * 2.0;
+    for(int i = 0; i < k; i++) snes->apuCatchupCycles += rate;     // same rounding as one step at a time
+    snes->cycles += 2 * k;
+    snes->hPos += 2 * k;
+    if(snes->autoJoyTimer > 0) snes->autoJoyTimer = snes->autoJoyTimer > 2 * k ? snes->autoJoyTimer - 2 * k : 0;
+    n -= k;
   }
 }
 

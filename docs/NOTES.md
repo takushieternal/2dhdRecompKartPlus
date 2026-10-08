@@ -57,7 +57,13 @@ Unlock checks (each is `LDA.l $3067Fx` followed by `AND #3` / `CMP #1`, i.e. "10
 - `$81F01F` sets up the player karts. Top speed = `DATA_818000[character]`, then −`$80` (50cc), +0 (100cc), +`$A0` (150cc), stored by `STA $00B4,X` at `$81F040`.
 - `$81EFFF` scales the acceleration curve (`$81F00A`: 150cc = A + A/2), `$81F011` adds `$30` to a second stat block at 150cc (`$81F01B`).
 - `$81FEB6` copies the CPU drivers' 64-entry speed profile for the class (pointers at `$81FED5`) ×16 into `$0690` (`STA $0690,X` at `$81FEC9`).
-- 200cc (version 5, `emu/rules.c`) hooks those four instructions: top speed +`$140`, acceleration ×2, stat bonus `$60`, CPU profile ×1.3 (capped).
+- `$0710` (player 1) / `$0768` (player 2): the kart's stat block. `$0710-$072F` is the acceleration curve, 16 bands of speed `$40`, read by `$80A7E1` (band = min(speed, `$3FF`) / `$40`). The curve falls off at high speed, so the karts never get near the top speed in `$B4`: in practice speed flattens out around `$340`.
+- 200cc (`emu/rules.c`) hooks:
+  - top speed: another +`$A0` over 150cc;
+  - the acceleration curve (`$81F058`): band b takes the base value of band b/1.15, ×2, and bands 10-15 (speed `$280`+) get at least `$600` (about 6 units of speed per frame). Without the floor the kart gains about 1 unit per frame up there and never reaches its top speed. Version 5 only scaled the curve; 6.0 stretched it but had no floor;
+  - the stat bonus: `$60`;
+  - the CPU profile: ×1.15, capped (version 5: ×1.3, 6.0: ×1.2). Measured peaks on Mario Circuit 1: computers about `$4C0`, player top speed `$4D0` + coins × 8.
+- Kart speed is `$EA`. `$D6` = `$B4` + coins × 8 is the effective cap.
 
 ## Unlocks (verified by the `gpfull` campaign)
 - Gold in Mushroom, Flower and Star at 100cc unlocks the **Special Cup** (100cc list).

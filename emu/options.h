@@ -32,10 +32,32 @@ typedef struct {
   int turboRate;        // frames per on/off cycle: 2 (30 Hz), 4 (15 Hz), 6 (10 Hz), 8 (7.5 Hz)
   bool unlockAll;       // Special Cup, 150cc and 200cc without the trophies (the save isn't changed)
   bool mode200;         // 200cc replaces 150cc (needs 150cc Special Cup gold or unlockAll)
+  // online
+  int netPort;          // UDP port for hosting (default 7845)
+  int netDelay;         // input delay in frames, 0 = automatic
+  bool netRollback;     // rollback netcode (off = lockstep)
+  bool netStats;        // show ping / rollback in a corner while playing online
+  char netLastJoin[48]; // last room code or address joined
   // controls
   int keyBind[SB_COUNT];   // SDL scancode per SNES button (player 1 keyboard)
   int padBind[SB_COUNT];   // gamepad button per SNES button (both gamepads)
 } Options;
+
+// Online page state, written by online.c, shown and partly edited by the menu
+enum { NETUI_OFF, NETUI_HOSTING, NETUI_JOINING, NETUI_RUNNING };
+typedef struct {
+  int mode;                 // NETUI_*
+  bool joinPage;            // client socket open (join page)
+  char code[24];            // our room code ("" while it's being found)
+  char codeNote[64];        // how the code was found / what to do if it doesn't work
+  char lan[32];             // our LAN address
+  char status[64];
+  char joinText[48];        // room code / address being typed (join page)
+  char punchText[48];       // host: player 2's code
+  int nlan; char lanNames[4][48];
+  int lanSel;               // LAN game picked in the menu
+  bool isHost; int ping, delay; bool rollback;
+} NetUi;
 
 typedef struct {
   bool glAvailable;     // HD-2D possible
@@ -45,9 +67,12 @@ typedef struct {
   bool unlocked200;     // 200cc earned (or unlock-everything on)
   uint8_t netRules;     // in netplay: the session's rules (rules_pack format, set by the host)
   const char* (*keyName)(int scancode);   // display names for the bindings
+  NetUi* net;
 } MenuCaps;
 
-enum { MENU_NONE = 0, MENU_CHANGED, MENU_CLOSED, MENU_QUIT, MENU_PHOTO };
+enum { MENU_NONE = 0, MENU_CHANGED, MENU_CLOSED, MENU_QUIT, MENU_PHOTO,
+       MENU_NET_HOST, MENU_NET_JOINPAGE, MENU_NET_JOIN, MENU_NET_JOINLAN, MENU_NET_PUNCH, MENU_NET_CANCEL,
+       MENU_NET_COPY, MENU_NET_PASTE, MENU_NET_DISCONNECT, MENU_NET_LANSEARCH };
 
 void opt_defaults(Options* o);
 void opt_defaultBindings(Options* o);
@@ -73,6 +98,14 @@ bool menu_capturing(const Menu* m);
 void menu_captureKey(Menu* m, Options* o, int scancode);
 void menu_capturePad(Menu* m, Options* o, int button);
 void menu_captureCancel(Menu* m);
+// Text fields (Online page): while menu_editing(), typed text goes to menu_editText and these keys
+// to menu_editKey; the gamepad drives an on-screen keyboard through menu_update.
+enum { EDIT_BACKSPACE = 1, EDIT_ENTER, EDIT_CANCEL };
+bool menu_editing(const Menu* m);
+void menu_editText(Menu* m, NetUi* ui, const char* text);
+int menu_editKey(Menu* m, NetUi* ui, int key);        // may return a MENU_NET_* action (Enter)
+// open a page programmatically (e.g. after --host on the command line)
+void menu_showOnline(Menu* m, int page);              // 0 online, 1 host, 2 join
 // Draw into an RGBA (0xAABBGGRR) overlay of 256x224 virtual pixels. Clears it first.
 void menu_draw(const Menu* m, const Options* o, const MenuCaps* caps, uint32_t* rgba);
 // Title-screen hint ("SELECT: ENHANCEMENTS") into the same overlay format.
@@ -80,6 +113,8 @@ void menu_drawHint(uint32_t* rgba, int frame);
 // Photo-mode help line (and a status message when msg != NULL) into the overlay format.
 void menu_drawPhotoHint(uint32_t* rgba, const char* msg, bool showHelp);
 const char* opt_padName(int button);
+// Online status line (ping etc.) and/or a short message, into the overlay format (clears it first)
+void menu_drawStatus(uint32_t* rgba, const char* hud, const char* toast);
 
 #define MENU_W 256
 #define MENU_H 224

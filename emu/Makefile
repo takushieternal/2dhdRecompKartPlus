@@ -24,8 +24,8 @@ smktrace: smktrace.c $(CORE) rules.h snes/*.h $(RC_OBJ)
 clean:
 	rm -rf smktrace smktrace.exe smkplay smkplay.exe obj objwin
 
-smkplay: smkplay.c netplay.c netplay.h hd2d.c hd2d.h options.c options.h font5x7.h $(CORE) rules.h snes/*.h $(RC_OBJ)
-	$(CC) $(CFLAGS) -I snes $(RC_FLAGS) `sdl2-config --cflags` -o $@ smkplay.c netplay.c hd2d.c options.c $(CORE) $(RC_OBJ) `sdl2-config --libs` -lm
+smkplay: smkplay.c netplay.c netplay.h online.c online.h upnp.c upnp.h hd2d.c hd2d.h options.c options.h font5x7.h $(CORE) rules.h snes/*.h $(RC_OBJ)
+	$(CC) $(CFLAGS) -I snes $(RC_FLAGS) `sdl2-config --cflags` -o $@ smkplay.c netplay.c online.c upnp.c hd2d.c options.c $(CORE) $(RC_OBJ) `sdl2-config --libs` -lm
 
 # Windows cross-build (mingw-w64 + SDL2 mingw devel package)
 WINCC ?= x86_64-w64-mingw32-gcc
@@ -35,8 +35,8 @@ objwin/%.o: ../recomp/%.c ../recomp/recomp_rt.h ../recomp/smk.h snes/cpu_core.in
 	@mkdir -p $(dir $@)
 	$(WINCC) -O1 -g0 -Wno-unused-label -I snes $(RC_FLAGS) -c $< -o $@
 win: smkplay.exe smktrace.exe
-smkplay.exe: smkplay.c netplay.c netplay.h hd2d.c hd2d.h options.c options.h font5x7.h $(CORE) rules.h snes/*.h $(RC_OBJW)
-	$(WINCC) -O2 -I snes $(RC_FLAGS) -I $(SDL2WIN)/include/SDL2 -Dmain=SDL_main -o $@ smkplay.c netplay.c hd2d.c options.c $(CORE) $(RC_OBJW) \
+smkplay.exe: smkplay.c netplay.c netplay.h online.c online.h upnp.c upnp.h hd2d.c hd2d.h options.c options.h font5x7.h $(CORE) rules.h snes/*.h $(RC_OBJW)
+	$(WINCC) -O2 -I snes $(RC_FLAGS) -I $(SDL2WIN)/include/SDL2 -Dmain=SDL_main -o $@ smkplay.c netplay.c online.c upnp.c hd2d.c options.c $(CORE) $(RC_OBJW) \
 	  -L $(SDL2WIN)/lib -lmingw32 -lSDL2main -lSDL2 -lws2_32 -mwindows -static-libgcc -lm
 smktrace.exe: smktrace.c $(CORE) rules.h snes/*.h $(RC_OBJW)
 	$(WINCC) -O2 -I snes $(RC_FLAGS) -o $@ smktrace.c $(CORE) $(RC_OBJW) -static -lm

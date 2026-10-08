@@ -2,10 +2,12 @@
 // the original 65816 code runs on an interpreter core with the HLE DSP-1.
 // Phase 2 swaps the interpreter for recompiled C while keeping this frontend.
 //
-//   smkplay [rom.sfc] [--host [port]] [--join host[:port]] [--delay frames] [--interp] [--nogl]
+//   smkplay [rom.sfc] [--host [port]] [--join code|host[:port]] [--delay frames] [--norollback] [--interp] [--nogl]
 //     rom defaults to smk.sfc next to the executable
-//     --host / --join   2-player netplay over UDP (default port 7845); host = player 1
-//     --delay N         netplay input delay in frames (host decides, default 3)
+//     --host / --join   2-player online play over UDP (default port 7845); host = player 1.
+//                       Same as Online > Host / Join in the Enhancements menu (room codes, LAN list)
+//     --delay N         online input delay in frames (host decides; default automatic)
+//     --norollback      lockstep instead of rollback (host decides)
 //     --wide            start in widescreen (16:9, toggle with F2)
 //     --hd2d            HD-2D renderer (OpenGL 3.3): Mode 7 floors re-rendered in 3D at full resolution
 //                       (F3 = 3D on/off, F4 = tint re-rendered geometry, F6 = HD-2D post effects on/off)
@@ -36,6 +38,7 @@
 #include "dsp1.h"
 #include "options.h"
 #include "rules.h"
+#include "online.h"
 #include <time.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -89,7 +92,9 @@ static void writeFile(const char* path, const void* d, int len) {
   fwrite(d, 1, len, f); fclose(f);
 }
 
+static bool sramLocked;     // an online session loaded the host's save: never write it over ours
 static void saveSram(bool force) {
+  if(sramLocked) return;
   uint8_t buf[0x800];
   int n = snes_saveBattery(snes, NULL);
   if(n <= 0 || n > (int)sizeof buf) return;
@@ -222,6 +227,31 @@ static void openPads(void) {
 
 static void runFrameTapped(void) { dsp1_tapReset(); snes_runFrame(snes); }
 
+// ------------------------------------------------------------------ online session (netplay.c / online.c)
+static NetUi netUi;
+static uint8_t* rbSlot[NET_SLOTS]; static int rbLen[NET_SLOTS], rbCap;
+static void rbSave(void* ctx, int k) {
+  (void)ctx;
+  int n = snes_saveState(snes, NULL);
+  if(n > rbCap) { rbCap = n + 65536; for(int i = 0; i < NET_SLOTS; i++) rbSlot[i] = realloc(rbSlot[i], rbCap); }
+  rbLen[k] = snes_saveState(snes, rbSlot[k]);
+}
+static void rbLoad(void* ctx, int k) { (void)ctx; snes_loadState(snes, rbSlot[k], rbLen[k]); }
+static void rbRun(void* ctx, uint16_t p1, uint16_t p2, bool render) {
+  (void)ctx;
+  for(int i = 0; i < 12; i++) { snes_setButtonState(snes, 1, i, (p1 >> i) & 1); snes_setButtonState(snes, 2, i, (p2 >> i) & 1); }
+  snes->ppu->headless = !render;
+  runFrameTapped();
+  snes->ppu->headless = false;
+}
+static uint64_t rbHash(void* ctx, int k) {
+  (void)ctx;
+  uint64_t h = 0xcbf29ce484222325ull;
+  for(int i = 0; i < rbLen[k]; i++) { h ^= rbSlot[k][i]; h *= 0x100000001b3ull; }
+  return h;
+}
+static const NetEmu rbEmu = {NULL, rbSave, rbLoad, rbRun, rbHash};
+
 // ------------------------------------------------------------------ options
 static Options opt;
 static MenuCaps caps;
@@ -292,7 +322,8 @@ static void createClassic(int w, int h) {
 int main(int argc, char** argv) {
   const char* romPath = NULL;
   const char* joinHost = NULL;
-  int hostPort = 0, joinPort = 7845, delay = 3;
+  int hostPort = 0, joinPort = 7845, delay = -1;
+  bool noRollback = false;
   bool interp = false, hdStart = false, wideStart = false, hd2dMode = false, noGL = false;
   char hostBuf[256];
   for(int i = 1; i < argc; i++) {
@@ -304,6 +335,7 @@ int main(int argc, char** argv) {
       joinHost = hostBuf;
     }
     else if(!strcmp(argv[i], "--delay") && i + 1 < argc) delay = atoi(argv[++i]);
+    else if(!strcmp(argv[i], "--norollback")) noRollback = true;
     else if(!strcmp(argv[i], "--interp")) interp = true;
     else if(!strcmp(argv[i], "--hd")) hdStart = true;
     else if(!strcmp(argv[i], "--wide")) wideStart = true;
@@ -377,6 +409,10 @@ int main(int argc, char** argv) {
   opt.recompiled = false;
 #endif
   caps.keyName = keyName;
+  caps.net = &netUi;
+  online_init(crc, &netUi);
+  if(delay >= 0) opt.netDelay = delay > 8 ? 8 : delay;
+  if(noRollback) opt.netRollback = false;
   caps.netplay = hostPort || joinHost;
   rules_install();
   applyOptions(false);
@@ -393,34 +429,27 @@ int main(int argc, char** argv) {
   Menu* menu = menu_create();
   if(getenv("SMKPLAY_MENU")) menu_open(menu);
 
-  // ---- netplay setup: both sides power-cycle with the host's SRAM so they start identical
+  // ---- online: --host / --join start the same flow as the Online menu
   Netplay* net = NULL;
-  if(hostPort || joinHost) {
+  if(hostPort) {
+    opt.netPort = hostPort;
     uint8_t sbuf[0x800] = {0};
     int n = snes_saveBattery(snes, sbuf);
-    uint8_t ruleByte = rules_pack();          // host: offered rules; client: replaced by the host's
-    char err[256] = "";
-    char title[128];
-    snprintf(title, sizeof title, hostPort ? "Super Mario Kart - waiting for player 2 (UDP %d)..." : "Super Mario Kart - connecting...", hostPort);
-    SDL_SetWindowTitle(window, title);
-    if(renderer) { SDL_RenderClear(renderer); SDL_RenderPresent(renderer); }
-    net = hostPort ? net_host(hostPort, delay, crc, sbuf, n, &ruleByte, 0, err, sizeof err)
-                   : net_join(joinHost, joinPort, crc, sbuf, n, &ruleByte, 15000, err, sizeof err);
-    if(!net) {
-      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "smkplay netplay", err, window);
-      return 1;
-    }
-    snes_loadBattery(snes, sbuf, n);
-    rules_unpack(ruleByte);
-    rulesLocked = true;
-    caps.netRules = ruleByte;
-    caps.unlocked200 = rules.mode200 || rules_200Unlocked(sbuf);
-    printf("netplay: rules 200cc %s, unlock everything %s\n", rules.mode200 ? "on" : "off", rules.unlockAll ? "on" : "off");
-    snes_reset(snes, true);
-    snprintf(title, sizeof title, "Super Mario Kart - netplay %s (player %d, delay %d)", net_isHost(net) ? "host" : "client",
-             net_isHost(net) ? 1 : 2, net_delay(net));
-    SDL_SetWindowTitle(window, title);
+    online_host(hostPort, sbuf, n, rules_pack(), opt.netDelay, opt.netRollback);
+    menu_showOnline(menu, 1);
+  } else if(joinHost) {
+    char t[300];
+    if(strchr(joinHost, '.')) snprintf(t, sizeof t, "%s:%d", joinHost, joinPort);   // address
+    else snprintf(t, sizeof t, "%s", joinHost);                                   // room code
+    online_joinPage(opt.netPort);
+    snprintf(netUi.joinText, sizeof netUi.joinText, "%.47s", t);
+    online_join(t, joinPort);
+    menu_showOnline(menu, 2);
   }
+  char toast[96] = ""; int toastFrames = 0;
+  int pendingAct = MENU_NONE;
+  bool textInputOn = false;
+  SDL_StopTextInput();
   bool desyncShown = false;
 
   bool running = true, paused = false, ff = false;
@@ -450,6 +479,15 @@ int main(int argc, char** argv) {
             if(down && !e.key.repeat) {
               if(k == SDLK_ESCAPE) menu_captureCancel(menu);
               else { menu_captureKey(menu, &opt, e.key.keysym.scancode); opt_save(&opt, cfgPath); }
+            }
+            break;
+          }
+          if(menu_editing(menu)) {                    // Online page: typing a room code
+            if(down) {
+              if(k == SDLK_ESCAPE) menu_editKey(menu, &netUi, EDIT_CANCEL);
+              else if(k == SDLK_BACKSPACE) menu_editKey(menu, &netUi, EDIT_BACKSPACE);
+              else if(k == SDLK_RETURN || k == SDLK_KP_ENTER) pendingAct = menu_editKey(menu, &netUi, EDIT_ENTER);
+              else if(k == SDLK_v && (e.key.keysym.mod & KMOD_CTRL)) pendingAct = MENU_NET_PASTE;
             }
             break;
           }
@@ -498,6 +536,9 @@ int main(int argc, char** argv) {
         case SDL_CONTROLLERDEVICEADDED:
           if(!pads[0] || !pads[1]) { for(int i = 0; i < 2; i++) if(pads[i]) SDL_GameControllerClose(pads[i]); pads[0] = pads[1] = NULL; openPads(); }
           break;
+        case SDL_TEXTINPUT:
+          if(menu_editing(menu) && !(SDL_GetModState() & KMOD_CTRL)) menu_editText(menu, &netUi, e.text.text);
+          break;
         case SDL_DROPFILE: SDL_free(e.drop.file); break;
       }
     }
@@ -512,6 +553,47 @@ int main(int argc, char** argv) {
       uint16_t rawP1 = pollKeyboard(opt.keyBind) | pollPad(pads[0], opt.padBind);
       uint16_t rawP2 = pollPad(pads[1], opt.padBind);
       uint16_t local = rawP1 | rawP2 | pollKeyboard(defaultBinds.keyBind) | pollPad(pads[0], defaultBinds.padBind) | pollPad(pads[1], defaultBinds.padBind);
+      if(menu_editing(menu)) local = pollPad(pads[0], opt.padBind) | pollPad(pads[1], opt.padBind) | pollPad(pads[0], defaultBinds.padBind) | pollPad(pads[1], defaultBinds.padBind);
+      if(menu_editing(menu) != textInputOn) { textInputOn = !textInputOn; if(textInputOn) SDL_StartTextInput(); else SDL_StopTextInput(); }
+      // ---- online: connection progress, session start / end
+      {
+        int ev = online_update();
+        if(ev == ONL_STARTED) {
+          net = online_session();
+          saveSram(true);                              // flush our own save before the host's replaces it
+          uint8_t sb[0x800] = {0};
+          int n = net_sram(net, sb, sizeof sb);
+          snes_loadBattery(snes, sb, n);
+          sramLocked = true;
+          rules_unpack(net_rules(net));
+          rulesLocked = true;
+          caps.netplay = true; caps.netRules = net_rules(net);
+          caps.unlocked200 = rules.mode200 || rules_200Unlocked(sb);
+          snes_reset(snes, true);
+          memset(padState, 0, sizeof padState);
+          if(photo) { photo = false; hd2d_photoEnd(hd2d); }
+          menu_close(menu); inputLock = true; paused = false; ff = false;
+          char t[160];
+          snprintf(t, sizeof t, "Super Mario Kart - online, player %d (delay %d%s)", net_isHost(net) ? 1 : 2, net_delay(net), net_rollback(net) ? ", rollback" : "");
+          SDL_SetWindowTitle(window, t);
+          snprintf(toast, sizeof toast, "CONNECTED: YOU ARE PLAYER %d", net_isHost(net) ? 1 : 2); toastFrames = 240;
+          printf("netplay: connected as %s, delay %d, rollback %s, rules 200cc %s, unlock everything %s\n", net_isHost(net) ? "host" : "client",
+                 net_delay(net), net_rollback(net) ? "on" : "off", rules.mode200 ? "on" : "off", rules.unlockAll ? "on" : "off");
+        } else if(ev == ONL_ENDED || (net && !online_session())) {
+          net = NULL;
+          sramLocked = false;
+          int sl = 0; uint8_t* own = readFile(sramPath, &sl);
+          uint8_t zero[0x800] = {0};
+          if(own) { snes_loadBattery(snes, own, sl); free(own); } else snes_loadBattery(snes, zero, sizeof zero);
+          rulesLocked = false; caps.netplay = false;
+          applyOptions(false);
+          snes_reset(snes, true);
+          SDL_SetWindowTitle(window, "Super Mario Kart");
+          snprintf(toast, sizeof toast, "%s", netUi.status[0] ? netUi.status : "DISCONNECTED"); toastFrames = 300;
+          printf("netplay: session ended (%s)\n", toast);
+          if(testFrames) running = false;
+        } else if(ev == ONL_FAILED) { snprintf(toast, sizeof toast, "%s", netUi.status); toastFrames = 240; }
+      }
       if(menuKeys) {                                   // test hook
         const char* q = menuKeys; local = 0;
         while(q && *q) { unsigned f = 0, b = 0; if(sscanf(q, "%u:%i", &f, &b) == 2 && f == uiFrames) local = (uint16_t)b; q = strchr(q, ','); if(q) q++; }
@@ -546,32 +628,57 @@ int main(int argc, char** argv) {
         else if(r == MENU_CLOSED) { opt_save(&opt, cfgPath); inputLock = true; }
         else if(r == MENU_QUIT) running = false;
         else if(r == MENU_PHOTO) { opt_save(&opt, cfgPath); if(hd2d && !net && hd2d_photoBegin(hd2d)) photo = true; inputLock = true; }
+        else if(r >= MENU_NET_HOST) pendingAct = r;
+      }
+      if(pendingAct) {                                 // Online page actions
+        int a = pendingAct; pendingAct = MENU_NONE;
+        if(a == MENU_NET_HOST) {
+          opt_save(&opt, cfgPath);
+          uint8_t sb[0x800] = {0};
+          int n = snes_saveBattery(snes, sb);
+          online_host(opt.netPort, sb, n, rules_pack(), opt.netDelay, opt.netRollback);
+        } else if(a == MENU_NET_JOINPAGE) online_joinPage(opt.netPort);
+        else if(a == MENU_NET_JOIN && netUi.joinText[0]) {
+          snprintf(opt.netLastJoin, sizeof opt.netLastJoin, "%s", netUi.joinText); opt_save(&opt, cfgPath);
+          online_join(netUi.joinText, opt.netPort);
+        } else if(a == MENU_NET_JOINLAN) online_joinLan(netUi.lanSel);
+        else if(a == MENU_NET_LANSEARCH) online_lanSearch(opt.netPort);
+        else if(a == MENU_NET_PUNCH && netUi.punchText[0]) online_punch(netUi.punchText, NET_DEFAULT_PORT);
+        else if(a == MENU_NET_CANCEL) online_cancel();
+        else if(a == MENU_NET_COPY && netUi.code[0]) {
+          SDL_SetClipboardText(netUi.code);
+          snprintf(toast, sizeof toast, "COPIED %s", netUi.code); toastFrames = 120;
+        } else if(a == MENU_NET_PASTE) {
+          char* t = SDL_GetClipboardText();
+          if(t) { menu_editText(menu, &netUi, t); SDL_free(t); }
+        } else if(a == MENU_NET_DISCONNECT) online_end();
       }
       bool menuOpen = menu_isOpen(menu);
       if(inputLock && !local) inputLock = false;
       bool muted = menuOpen || inputLock;
       if(paused || (menuOpen && !net)) continue;      // the game waits while the menu is open (not in netplay)
       if(net) {
-        uint16_t p1, p2;
         bool racing = snes->ram[0x36] == 0x02 && snes->ram[0x3A] == 0x06;
         // transforms (turbo, auto-gas) happen before sending: both sides run exactly these inputs
         uint16_t mine = muted ? 0 : opt_transformPad(&opt, &padState[0], rawP1, racing);
         if(testSeed) { uint32_t f = net_frameNo(net) / 20; uint32_t x = (f + 1) * 2654435761u ^ testSeed * 40503u; mine = (x >> 7) & 0x0ff3; }
-        int r = net_frame(net, mine, &p1, &p2);
-        if(r < 0) {
-          SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "smkplay netplay", "The other player disconnected.", window);
-          net_close(net); net = NULL; caps.netplay = false; SDL_SetWindowTitle(window, "Super Mario Kart (offline)");
-          continue;
-        }
-        if(r == 0) { acc = 0; break; }       // waiting for the other side's input
-        applyPads(p1, p2);
-        runFrameTapped();
-        if(testFrames && net_frameNo(net) == (uint32_t)testFrames - 60)
-          printf("netplay: test checkpoint frame %u hash %016llx\n", net_frameNo(net), (unsigned long long)wramHash());
-        if(((net_frameNo(net) - 1) % 60) == 0 && !net_checkHash(net, wramHash()) && !desyncShown) {
+        int r = net_tick(net, mine, &rbEmu);
+        if(r <= 0) continue;                           // waiting for the other player (or gone: handled above)
+        NetStats ns; net_stats(net, &ns);
+        if(ns.desync && !desyncShown) {
           desyncShown = true;
-          printf("netplay: DESYNC detected at frame %u\n", net_frameNo(net) - 1);
-          SDL_SetWindowTitle(window, "Super Mario Kart - netplay DESYNC (restart both sides)");
+          printf("netplay: DESYNC detected around frame %u\n", net_frameNo(net));
+          SDL_SetWindowTitle(window, "Super Mario Kart - online DESYNC (reconnect)");
+          snprintf(toast, sizeof toast, "OUT OF SYNC: PLEASE RECONNECT"); toastFrames = 600;
+        }
+        if(testFrames && running && net_frameNo(net) >= (uint32_t)testFrames) {
+          uint32_t cp = (uint32_t)((testFrames - 60) / 60 * 60); uint64_t hv;
+          if(net_checkpoint(net, cp, &hv)) {
+            printf("netplay: test checkpoint frame %u hash %016llx\n", cp, (unsigned long long)hv);
+            printf("netplay: stats rtt %dms delay %d rollback %s rollbacks %u (last %d, max %d) stalls %u\n", ns.rttMs, ns.delay,
+                   ns.rollback ? "on" : "off", ns.rollbacks, ns.lastRollback, ns.maxRollback, ns.stalls);
+            running = false;
+          }
         }
       } else {
         bool racing = snes->ram[0x36] == 0x02 && snes->ram[0x3A] == 0x06;
@@ -591,14 +698,25 @@ int main(int argc, char** argv) {
       else if(snes->ppu->widescreen) {
         if(SDL_LockTexture(textureWide, NULL, &px, &pitch) == 0) { snes_setPixelsWide(snes, px); SDL_UnlockTexture(textureWide); }
       } else if(SDL_LockTexture(texture, NULL, &px, &pitch) == 0) { snes_setPixels(snes, px); SDL_UnlockTexture(texture); }
-      if(++frames % 300 == 0 && !hostPort && !joinHost) saveSram(false);
-      if(testFrames && (int)frames >= testFrames) running = false;
+      if(++frames % 300 == 0) saveSram(false);
+      if(testFrames && (int)frames >= testFrames && !net && !hostPort && !joinHost) running = false;
+      if(testFrames && (hostPort || joinHost) && (int)uiFrames > testFrames * 4 + 1800) { printf("netplay: test timed out\n"); running = false; }
     }
     if(testFrames && (menu_isOpen(menu) || photo) && (int)uiFrames >= testFrames) running = false;   // test hook with the menu open
     // ---- overlay: the menu, or the title-screen hint
     bool overlayOn = true;
     if(photo) menu_drawPhotoHint(overlay, photoMsgFrames ? photoMsg : NULL, photoHelp && !(testFrames && getenv("SMKPLAY_SHOT")));
     else if(menu_isOpen(menu)) menu_draw(menu, &opt, &caps, overlay);
+    else if(toastFrames > 0 || (net && opt.netStats)) {
+      char hud[64] = "";
+      if(net && opt.netStats) {
+        NetStats ns; net_stats(net, &ns);
+        snprintf(hud, sizeof hud, "P%d %dMS D%d%s", net_isHost(net) ? 1 : 2, ns.rttMs, ns.delay, ns.rollback ? (ns.lastRollback ? " RB" : "") : " LOCK");
+        if(ns.rollback && ns.lastRollback) { size_t l = strlen(hud); snprintf(hud + l, sizeof hud - l, "%d", ns.lastRollback); }
+      }
+      menu_drawStatus(overlay, hud, toastFrames > 0 ? toast : NULL);
+      if(toastFrames > 0) toastFrames--;
+    }
     else if(snes->ram[0x36] == 0x04) menu_drawHint(overlay, uiFrames);
     else overlayOn = false;
     if(hd2d) {
@@ -648,11 +766,12 @@ int main(int argc, char** argv) {
     SDL_RenderPresent(renderer);
   }
   if(net) {
-    printf("netplay: ran %u frames, WRAM hash %016llx%s\n", net_frameNo(net), (unsigned long long)wramHash(), desyncShown ? " (DESYNC seen)" : "");
-    net_close(net);
+    printf("netplay: ran %u frames%s\n", net_frameNo(net), desyncShown ? " (DESYNC seen)" : "");
+    if(testFrames) net_linger(net, 1500);
   }
+  online_shutdown();
   opt_save(&opt, cfgPath);
-  if(!hostPort && !joinHost) saveSram(true);   // netplay sessions don't overwrite your save
+  saveSram(true);                                // (not during an online session: sramLocked)
   menu_free(menu);
   snes_free(snes);
   SDL_Quit();

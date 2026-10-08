@@ -33,8 +33,9 @@ The recompiled instructions call the interpreter's own per-opcode functions (`em
 | Netplay: delay-based lockstep over UDP, host = P1; the host's SRAM is sent so both sides start identical; WRAM hash every 60 frames for desync detection | **done**: `smkplay --host` / `--join`; verified in sync over 5k frames with different inputs on each side |
 | HD Mode 7: 2×2 samples per floor pixel (render-only, so netplay-safe) | **done**: `--hd` or H key |
 | Version 5 gameplay options: remapping (keys + gamepad), turbo, auto-gas (frontend, applied before netplay send); 200cc and unlock everything as instruction hooks (`emu/rules.c`, both engines), sent in the netplay handshake | **done** |
-| Online setup from the menu (room codes / hole punching, auto delay) | **next** (version 6): `docs/NETPLAY.md` |
-| Rollback on top of the lockstep protocol (needs faster resimulation: skip rendering/audio while re-running frames) | **next** (version 6): `docs/NETPLAY.md` |
+| Online setup from the menu: room codes (STUN), UPnP, LAN discovery, hole punching, automatic delay | **done** (version 6): `docs/NETPLAY.md` |
+| Rollback (up to 8 frames, headless replay, time sync, confirmed-state hashes) | **done** (version 6) |
+| Relay server for symmetric NAT, spectators | next |
 | Widescreen 16:9 (400×224): Mode 7 floor and BG layers rendered into side columns. Sprites that are partly on screen continue into the sides; hidden/parked sprites stay hidden. BG3 (HUD) is kept out of the sides. Frames with no Mode 7 (menus, title) are pillarboxed. Render-only | **done** (version2): `--wide` / F2 |
 | Widescreen part 2: the game culls karts and objects at the original screen edges, so they pop in at the 4:3 border. Fix by widening the culling test with a C override once it's located | next |
 | HD Mode 7 with true per-line interpolation (the lower half-line currently reuses the same line's matrix) | planned |

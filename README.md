@@ -1,4 +1,25 @@
-# marioKartRecomp, version 5
+# marioKartRecomp, version 6.1
+
+**6.1: 200cc that you can actually win.** In 6.0 your kart still crawled towards its 200cc top speed at about 1 unit per frame above speed `$280`, and never got near it on a real straight, while the computer drivers ran at full speed. 200cc now gives the top of the acceleration curve a floor: you reach about `$4B6` on the Mario Circuit start straight (150cc: `$346`). The computer drivers are +15% over 150cc (6.0: +20%) and peak around `$4C0`, right at your top speed (`$4D0` plus coins). Everything else is the same as 6.0.
+
+# Version 6
+
+Version 6 is about **playing online**:
+
+- **Online page** in the Enhancements menu (Esc, or Select on the title screen): *Host a game* / *Join a game*. No command line needed.
+- **Room codes instead of IP addresses.** The host gets a code like `SC07-21RY-MMKS` and sends it to player 2 (*Copy room code* puts it on the clipboard). Player 2 types or pastes it, on the keyboard or with the on-screen keyboard on a gamepad. The code holds the host's public address, found with STUN.
+- **No port forwarding in most homes.** The host asks the router to open the port (UPnP). If the router won't, player 2's join page shows *their* code: the host types it under *Player 2's code*, and both sides punch through their NATs.
+- **Same network:** games on your LAN show up on the join page automatically.
+- **Automatic input delay:** the host measures the ping while connecting and picks the delay. You can still set it by hand on the Online page.
+- **Rollback netcode** (on by default): your own inputs act at once (1-3 frames of delay instead of 3-10). If the other player's input arrives late, the game rewinds and replays the missed frames invisibly, up to 8 frames. Turn it off on the Online page to get the old lockstep mode. Your save is never overwritten by an online session: both sides play with the host's save, and yours comes back when you disconnect.
+- **Ping display** in the top-left corner while online (*Show ping* on the Online page).
+- **200cc fix:** in version 5, 200cc sped up the computer drivers but hardly the human karts. The kart's acceleration falls off at high speed, so a higher top speed was never reached. 200cc now stretches the acceleration curve over 15% more speed and doubles it: you accelerate harder and keep going up to about 15% more speed. The computer drivers get +20% to match (was +30%).
+
+Under the hood, the emulator got about 2x faster when it isn't drawing (rollback replays frames without drawing them), and save states are about 3x faster. Neither change alters the game: the frame hashes are identical to version 4/5. Details: `docs/NETPLAY.md`.
+
+---
+
+# Version 5
 
 Version 5 reorganises the Enhancements menu into **Video / Gameplay / Controls** pages and adds:
 
@@ -59,7 +80,9 @@ emu/            hardware emulation (LakeSnes, MIT) + DSP-1 HLE + programs
   options.c          Enhancements menu, settings file, remapping, turbo / auto-gas
   rules.c            gameplay options as instruction hooks (200cc, unlock everything)
   hd2d.c             HD-2D renderer (OpenGL 3.3)
-  netplay.c          2-player lockstep netplay over UDP
+  netplay.c          2-player online play over UDP: handshake, STUN, room codes, rollback / lockstep
+  online.c           the Online menu's connection flow (threads for DNS and UPnP)
+  upnp.c             asks the router to forward the port (UPnP IGD)
   smktrace.c         headless runner: scripts, coverage, hashes, watchpoints, screenshots
 recomp/
   gen/               GENERATED C from your ROM (git-ignored)
@@ -90,12 +113,12 @@ bin/win/         Windows binaries: smkplay.exe (recompiled build), smktrace.exe,
    - Esc or Select on the title screen = Enhancements menu. F2 = widescreen 16:9, F3 = HD-2D, F8 = photo mode, H = HD Mode 7, F5/F9 = save/load state, hold Tab = fast-forward, P = pause, F11 = fullscreen, 1–6 = window scale.
    - `smkplay.exe --hd2d` starts the HD-2D renderer (needs OpenGL 3.3; F3 = 3D on/off, F6 = post effects).
    - `smkplay.exe --wide --hd` starts in widescreen with HD Mode 7. `--interp` runs the original code on the interpreter instead of the recompiled C.
-3. **Netplay (2 players, 2 PCs):**
-   - Player 1: `smkplay.exe --host` (UDP port 7845; open it in the firewall, or use a LAN/VPN such as WireGuard).
-   - Player 2: `smkplay.exe --join <host-ip>`.
-   - Options: `--host 9000`, `--join 10.0.0.5:9000`, `--delay 2` (host picks the input delay; raise it on bad connections).
-   - Both sides need the same ROM. Player 2 gets the host's save data for the session, and their own save is left untouched.
-   - Pick **2P GAME** on the title screen: player 1 is the host, player 2 the client.
+3. **Online (2 players, 2 PCs):**
+   - Player 1: Esc → **Online → Host a game**. Send the room code to player 2.
+   - Player 2: Esc → **Online → Join a game**, type or paste the code, **Connect**. On the same network, just pick the game from the list.
+   - If it doesn't connect after a few seconds, player 2 sends *their* code (shown on the join page) back, and the host enters it under *Player 2's code*.
+   - Both sides need the same ROM and version 6. The game restarts on both PCs with the host's save. Pick **2P GAME**: the host is player 1.
+   - Command line still works: `--host [port]`, `--join <code or ip[:port]>`, `--delay N`, `--norollback`.
 4. **Disassembly / recompilation pipeline** (Python 3):
    ```
    python trace\run_coverage.py smk.sfc          # campaigns -> asm\ -> byte-identical rebuild check

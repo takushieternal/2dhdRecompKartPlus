@@ -25,15 +25,28 @@ bool rule_200_topSpeed(Cpu* c) {
   return true;
 }
 
-// $81F00A  LSR A (150cc branch of the acceleration-curve scaler: A + A/2). 200cc: A * 2.
-SMK_RULE(0x81F00A, rule_200_accel)
-bool rule_200_accel(Cpu* c) {
-  if(!rules.mode200) return false;
-  fetchIns(c, 1);
-  uint32_t v = (uint32_t)c->a * 2;
-  c->a = v > 0xffff ? 0xffff : (uint16_t)v;
-  c->c = false; zn16(c, c->a);
-  c->pc = 0xF00E;                                                     // the routine's RTS
+// $81F058  STA [$04],Y : one entry of the player kart's acceleration curve (16 speed bands of $40,
+// read by $80A7E1). 150cc stores base*16*1.5. The curve falls off at high speed, so only raising
+// the top speed doesn't make a human kart faster: it never gets near it. 200cc stretches the curve
+// over 15% more speed (band b takes base band b/1.15) and doubles it, so the kart accelerates
+// harder and keeps accelerating up to a higher speed.
+SMK_RULE(0x81F058, rule_200_accelCurve)
+bool rule_200_accelCurve(Cpu* c) {
+  if(!rules.mode200 || ccIndex(c) != 4) return false;
+  fetchIns(c, 2);
+  int idx = c->y >> 1;                                  // band 0..15
+  int src = idx * 100 / 115;
+  uint32_t a = (c->db << 16) | (uint16_t)(c->x - idx + src);
+  uint32_t v = (uint32_t)c->read(c->mem, a) * 16 * 2;
+  // The top bands (speed $280 and up) are where 150cc runs out of push: the kart crawls towards its
+  // top speed at about 1 unit per frame and never gets there on a real straight, while the computer
+  // drivers run at theirs. Give the top bands a floor so the kart actually reaches 200cc speed.
+  if(idx >= 10 && v < 0x600) v = 0x600;
+  if(v > 0xffff) v = 0xffff;
+  uint16_t dp = c->dp;
+  uint32_t ptr = c->read(c->mem, (uint16_t)(dp + 4)) | c->read(c->mem, (uint16_t)(dp + 5)) << 8 | c->read(c->mem, (uint16_t)(dp + 6)) << 16;
+  busw(c, ptr + c->y, (uint16_t)v);
+  c->pc = 0xF05A;
   return true;
 }
 
@@ -51,12 +64,12 @@ bool rule_200_bonus(Cpu* c) {
 }
 
 // $81FEC9  STA $0690,X : the CPU drivers' per-class speed profile (64 entries, value*16).
-// 200cc: 150cc profile * 1.3 so the field keeps up.
+// 200cc: 150cc profile * 1.15: the same step up as the player karts get (top speed +$A0 over 150cc).
 SMK_RULE(0x81FEC9, rule_200_cpuProfile)
 bool rule_200_cpuProfile(Cpu* c) {
   if(!rules.mode200 || ccIndex(c) != 4) return false;
   fetchIns(c, 3);
-  uint32_t v = (uint32_t)c->a * 13 / 10;
+  uint32_t v = (uint32_t)c->a * 23 / 20;
   if(v > 0x0ff0) v = 0x0ff0;
   busw(c, (c->db << 16) + 0x0690 + c->x, (uint16_t)v);
   c->pc = 0xFECC;
@@ -120,7 +133,7 @@ bool rule_unlock_858806(Cpu* c) { return unlockLoad(c); }
 // ------------------------------------------------------------------ dispatch (interpreter path)
 typedef bool (*RuleFn)(Cpu*);
 static const struct { uint32_t addr; RuleFn fn; } table[] = {
-  {0x81F040, rule_200_topSpeed}, {0x81F00A, rule_200_accel}, {0x81F01B, rule_200_bonus},
+  {0x81F040, rule_200_topSpeed}, {0x81F058, rule_200_accelCurve}, {0x81F01B, rule_200_bonus},
   {0x81FEC9, rule_200_cpuProfile},
   {0x84F668, rule_unlock_84F668},
   {0x84F674, rule_unlock_84F674},

@@ -199,12 +199,23 @@ static void shot(const char* dir, const char* name) {
 }
 
 static FILE* hashLog;
+#ifdef _WIN32
+#include <windows.h>
+static uint64_t usNow(void) { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return (uint64_t)(c.QuadPart * 1000000.0 / f.QuadPart); }
+#else
+#include <time.h>
+static uint64_t usNow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
+#endif
 static uint64_t fnv(uint64_t h, const void* p, size_t n) {
   const uint8_t* b = p;
   for(size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
   return h;
 }
+static uint64_t stateHash(void);
 static void logHash(void) {
+  fprintf(hashLog, "%u %llu %016llx\n", frameCount, (unsigned long long)snes->cycles, (unsigned long long)stateHash());
+}
+static uint64_t stateHash(void) {
   uint64_t h = 0xcbf29ce484222325ull;
   h = fnv(h, snes->ram, sizeof(snes->ram));
   h = fnv(h, snes->ppu->vram, sizeof(snes->ppu->vram));
@@ -213,7 +224,7 @@ static void logHash(void) {
   Cpu* c = snes->cpu;
   uint16_t regs[8] = {c->a, c->x, c->y, c->sp, c->pc, c->dp, c->k, c->db};
   h = fnv(h, regs, sizeof regs);
-  fprintf(hashLog, "%u %llu %016llx\n", frameCount, (unsigned long long)snes->cycles, (unsigned long long)h);
+  return h;
 }
 
 static void runFrames(int n, uint16_t p1, uint16_t p2) {
@@ -351,6 +362,47 @@ int main(int argc, char** argv) {
       printf("mathEnabled %d%d%d%d%d%d add %d half %d sub-obj %d main-obj %d\n", q->mathEnabled[0], q->mathEnabled[1], q->mathEnabled[2], q->mathEnabled[3], q->mathEnabled[4], q->mathEnabled[5], q->addSubscreen, q->halfColor, q->layer[4].subScreenEnabled, q->layer[4].mainScreenEnabled);
     }
     else if(!strcmp(a, "hd2dtaps")) { snes->ppu->hd2dTaps = !strcmp(b, "on"); snes->ppu->widescreen |= snes->ppu->hd2dTaps; }
+    else if(!strcmp(a, "rbtest")) {   // rbtest <frames> <window> [headless]: rollback self-test with random pads
+      int nf = atoi(b), w = atoi(c); char d4[32] = ""; sscanf(line, "%*s %*s %*s %31s", d4); bool hl = d4[0] == 'h';
+      int ss = snes_saveState(snes, NULL);
+      uint8_t** ring = malloc(sizeof(uint8_t*) * (w + 1));
+      for(int i = 0; i <= w; i++) ring[i] = malloc(ss + 4096);
+      uint16_t* inp = malloc(nf * 4); uint64_t* hs = malloc(nf * 8);
+      int bad = 0, rollbacks = 0; uint32_t seed = 12345;
+      uint64_t t0 = usNow(), tRun = 0, tRe = 0, tSave = 0;
+      for(int f = 0; f < nf; f++) {
+        uint64_t a0 = usNow();
+        snes_saveState(snes, ring[f % (w + 1)]);
+        uint64_t a1 = usNow(); tSave += a1 - a0;
+        if(f % 12 == 0) { seed = seed * 1103515245u + 12345u; }
+        inp[f * 2] = (seed >> 8) & 0x0fc3; inp[f * 2 + 1] = (seed >> 3) & 0x0fc3;
+        setPad(1, inp[f * 2]); setPad(2, inp[f * 2 + 1]);
+        dsp1_tapReset(); snes_runFrame(snes); frameCount++;
+        hs[f] = stateHash();
+        tRun += usNow() - a1;
+        if(f % w == w - 1 && f >= w) {
+          uint64_t r0 = usNow();
+          int from = f - w + 1;
+          if(!snes_loadState(snes, ring[from % (w + 1)], ss)) { printf("rbtest: load failed\n"); break; }
+          snes->ppu->headless = hl;
+          for(int g = from; g <= f; g++) {
+            if(g > from) snes_saveState(snes, ring[g % (w + 1)]);
+            setPad(1, inp[g * 2]); setPad(2, inp[g * 2 + 1]);
+            if(g == f) snes->ppu->headless = false;
+            dsp1_tapReset(); snes_runFrame(snes);
+            uint64_t hh = stateHash();
+            if(hh != hs[g] && bad++ < 10) printf("rbtest: frame %d differs after rollback (%016llx vs %016llx)\n", g, (unsigned long long)hh, (unsigned long long)hs[g]);
+          }
+          rollbacks++;
+          tRe += usNow() - r0;
+        }
+      }
+      printf("rbtest: %d frames, %d rollbacks of %d, %d mismatches; state %d bytes; us/frame run %.0f save %.0f, us/rollback %.0f (%s)\n",
+             nf, rollbacks, w, bad, ss, tRun / (double)nf, tSave / (double)nf, rollbacks ? tRe / (double)rollbacks : 0, hl ? "headless" : "rendering");
+      (void)t0;
+      for(int i = 0; i <= w; i++) free(ring[i]);
+      free(ring); free(inp); free(hs);
+    }
     else if(!strcmp(a, "rules")) { rules_unpack((uint8_t)strtol(b, NULL, 0)); }   // bit0 200cc, bit1 unlock all
     else if(!strcmp(a, "ws")) { snes->ppu->widescreen = !strcmp(b, "on"); }   // widescreen rendering (render-only)
     else if(!strcmp(a, "shotws")) {   // widescreen output, 800x448
